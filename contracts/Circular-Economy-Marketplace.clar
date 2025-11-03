@@ -20,6 +20,9 @@
 (define-constant err-manufacturer-not-found (err u116))
 (define-constant err-already-released (err u117))
 (define-constant err-dispute-exists (err u118))
+(define-constant err-warranty-expired (err u119))
+(define-constant err-warranty-not-found (err u120))
+(define-constant err-product-history-not-found (err u121))
 
 (define-constant condition-excellent u5)
 (define-constant condition-good u4)
@@ -36,6 +39,8 @@
 (define-data-var total-recycled-items uint u0)
 (define-data-var platform-fees-collected uint u0)
 (define-data-var total-rewards-distributed uint u0)
+(define-data-var warranty-id-nonce uint u0)
+(define-data-var product-history-id-nonce uint u0)
 
 (define-map manufacturers principal {
     name: (string-ascii 50),
@@ -96,6 +101,31 @@
     recycling-multiplier: uint,
     active-listings: uint,
     total-recycled: uint
+})
+
+(define-map product-warranties uint {
+    listing-id: uint,
+    manufacturer: principal,
+    warranty-duration-blocks: uint,
+    coverage-details: (string-ascii 200),
+    issued-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    claim-count: uint,
+    max-claims: uint
+})
+
+(define-map product-lifecycle-history uint {
+    listing-id: uint,
+    product-name: (string-ascii 100),
+    owner: principal,
+    previous-owner: (optional principal),
+    transfer-type: (string-ascii 20),
+    transfer-date: uint,
+    condition-at-transfer: uint,
+    price-at-transfer: uint,
+    warranty-id: (optional uint),
+    cycle-number: uint
 })
 
 (define-public (register-manufacturer (name (string-ascii 50)))
@@ -351,4 +381,104 @@
 
 (define-read-only (calculate-estimated-buyback (price uint) (condition uint))
     (ok (calculate-buyback-price price condition)))
+
+(define-public (issue-warranty 
+    (listing-id uint)
+    (duration-blocks uint)
+    (coverage (string-ascii 200))
+    (max-claims uint))
+    (let 
+        ((listing (unwrap! (map-get? product-listings listing-id) err-listing-not-found))
+         (warranty-id (+ (var-get warranty-id-nonce) u1))
+         (manufacturer-data (unwrap! (map-get? manufacturers tx-sender) err-manufacturer-not-found)))
+        
+        (asserts! (is-eq tx-sender (get manufacturer listing)) err-not-manufacturer)
+        (asserts! (get verified manufacturer-data) err-not-verified)
+        (asserts! (> duration-blocks u0) err-invalid-amount)
+        (asserts! (> max-claims u0) err-invalid-amount)
+        
+        (let ((expiry-block (+ stacks-block-height duration-blocks)))
+            (map-set product-warranties warranty-id {
+                listing-id: listing-id,
+                manufacturer: tx-sender,
+                warranty-duration-blocks: duration-blocks,
+                coverage-details: coverage,
+                issued-at: stacks-block-height,
+                expires-at: expiry-block,
+                is-active: true,
+                claim-count: u0,
+                max-claims: max-claims
+            })
+            
+            (var-set warranty-id-nonce warranty-id)
+            (ok warranty-id))))
+
+(define-public (record-lifecycle-event 
+    (listing-id uint)
+    (transfer-type (string-ascii 20))
+    (previous-owner-opt (optional principal))
+    (warranty-id-opt (optional uint)))
+    (let 
+        ((listing (unwrap! (map-get? product-listings listing-id) err-listing-not-found))
+         (history-id (+ (var-get product-history-id-nonce) u1))
+         (previous-history (get-latest-lifecycle-entry listing-id))
+         (default-history { listing-id: u0, product-name: "", owner: tx-sender, previous-owner: none, 
+                           transfer-type: "", transfer-date: u0, condition-at-transfer: u0, 
+                           price-at-transfer: u0, warranty-id: none, cycle-number: u0 })
+         (cycle-num (+ (get cycle-number (default-to default-history previous-history)) u1)))
+        
+        (map-set product-lifecycle-history history-id {
+            listing-id: listing-id,
+            product-name: (get product-name listing),
+            owner: tx-sender,
+            previous-owner: previous-owner-opt,
+            transfer-type: transfer-type,
+            transfer-date: stacks-block-height,
+            condition-at-transfer: (get condition listing),
+            price-at-transfer: (get price listing),
+            warranty-id: warranty-id-opt,
+            cycle-number: cycle-num
+        })
+        
+        (var-set product-history-id-nonce history-id)
+        (ok history-id)))
+
+(define-public (claim-warranty (warranty-id uint))
+    (let ((warranty (unwrap! (map-get? product-warranties warranty-id) err-warranty-not-found)))
+        (asserts! (get is-active warranty) err-warranty-expired)
+        (asserts! (<= stacks-block-height (get expires-at warranty)) err-warranty-expired)
+        (asserts! (< (get claim-count warranty) (get max-claims warranty)) err-invalid-amount)
+        
+        (map-set product-warranties warranty-id 
+            (merge warranty {
+                claim-count: (+ (get claim-count warranty) u1)
+            }))
+        (ok true)))
+
+(define-public (deactivate-warranty (warranty-id uint))
+    (let ((warranty (unwrap! (map-get? product-warranties warranty-id) err-warranty-not-found)))
+        (asserts! (is-eq tx-sender (get manufacturer warranty)) err-not-manufacturer)
+        (map-set product-warranties warranty-id 
+            (merge warranty { is-active: false }))
+        (ok true)))
+
+(define-read-only (get-warranty (warranty-id uint))
+    (map-get? product-warranties warranty-id))
+
+(define-read-only (get-lifecycle-history (history-id uint))
+    (map-get? product-lifecycle-history history-id))
+
+(define-read-only (check-warranty-status (warranty-id uint))
+    (match (map-get? product-warranties warranty-id)
+        warranty (ok {
+            is-valid: (and (get is-active warranty) (<= stacks-block-height (get expires-at warranty))),
+            claims-remaining: (- (get max-claims warranty) (get claim-count warranty)),
+            blocks-until-expiry: (if (> (get expires-at warranty) stacks-block-height)
+                                    (- (get expires-at warranty) stacks-block-height)
+                                    u0)
+        })
+        err-warranty-not-found))
+
+(define-private (get-latest-lifecycle-entry (listing-id uint))
+    (map-get? product-lifecycle-history (var-get product-history-id-nonce)))
 
